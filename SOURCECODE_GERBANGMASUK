@@ -1,0 +1,201 @@
+5.3.1 Source Code Inisialisasi
+
+Bagian ini mencakup konfigurasi awal saat sistem booting, termasuk pengaturan pin, inisialisasi LCD I2C, setup kamera ESP32, motor servo, dan koneksi WiFi.
+C++
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nBooting ESP32-CAM Gerbang Masuk...");
+
+  // Inisialisasi LCD I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+  lcd.init();
+  lcd.backlight();
+  tampilLCD("SYSTEM BOOTING", "MOHON TUNGGU...");
+
+  // Inisialisasi Pin Input/Output
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Inisialisasi Servo
+  palangServo.attach(SERVO_PIN);
+  tutupPalang();
+
+  // Inisialisasi Kamera ESP32
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  // ... (konfigurasi pin kamera Y2-Y9, XCLK, PCLK, VSYNC, HREF, I2C disesuaikan dengan deklarasi awal)
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 1;
+  } else {
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera Error: 0x%x\n", err);
+    tampilLCD("CAMERA ERROR!", "RESTARTING...");
+    delay(1000);
+    ESP.restart(); 
+    return;
+  }
+
+  // Pengaturan Sensor Gambar Kamera (Flip, Kecerahan, Kontras, dll)
+  sensor_t * s = esp_camera_sensor_get();
+  s->set_vflip(s, 1);   
+  s->set_hmirror(s, 0); 
+  s->set_brightness(s, 1);     
+  s->set_contrast(s, 1);       
+  s->set_exposure_ctrl(s, 1);  
+
+  // Inisialisasi Koneksi WiFi
+  WiFi.begin(ssid, password);
+  tampilLCD("KONEKSI WIFI...", ssid);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  digitalWrite(LED_PIN, HIGH);
+  tampilLCD("GATE MASUK SIAP", "SILAKAN MAJU");
+}
+
+5.3.2 Source Code Pembacaan Input atau Sensor
+
+Bagian ini berisi fungsi untuk membaca data dari sensor ultrasonik (mendeteksi keberadaan mobil) dan mendeteksi tekanan tombol untuk memicu pengambilan gambar.
+C++
+
+// Fungsi khusus membaca sensor ultrasonik
+long bacaUltrasonik() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  long durasi = pulseIn(ECHO_PIN, HIGH, 30000);
+  long jarak = durasi * 0.034 / 2; // Konversi ke centimeter
+  return jarak;
+}
+
+// Proses membaca sensor di dalam loop utama
+void bacaSensor() {
+  long jarak = bacaUltrasonik();
+  bool tombolDitekan = (digitalRead(BUTTON_PIN) == LOW);
+
+  // Status ketersediaan mobil berdasarkan jarak sensor (Maksimal 5 cm)
+  if (jarak > 0 && jarak <= 5) {
+    if (!mobilAda) {
+      mobilAda = true;
+      tampilLCD("MOBIL TERDETEKSI", "TEKAN TOMBOL");
+    }
+  } else {
+    if (mobilAda) {
+      mobilAda = false;
+      tampilLCD("GATE MASUK SIAP", "SILAKAN MAJU");
+    }
+  }
+}
+
+5.3.3 Source Code Pemrosesan Data
+
+Di sini, data input sensor dievaluasi. Jika kondisi masuk terpenuhi, kamera menangkap gambar, mengubahnya ke Base64, dan memproses komunikasi JSON ke server (ANPR / Automatic Number Plate Recognition) untuk validasi akses.
+C++
+
+void prosesData() {
+  // 1. Kondisi pemicu: Mobil ada, tombol ditekan, dan cooldown selesai
+  if (mobilAda && digitalRead(BUTTON_PIN) == LOW && millis() - lastTrigger > 3000) {
+    lastTrigger = millis();
+    digitalWrite(LED_PIN, LOW); // Indikator pemrosesan
+    tampilLCD("MENGAMBIL FOTO..", "MOHON TUNGGU");
+    
+    // 2. Pemrosesan Data Gambar Kamera
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      tampilLCD("GAGAL AMBIL FOTO", "COBA LAGI");
+      return;
+    }
+    String imageBase64 = base64::encode(fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+
+    // 3. Pemrosesan Data HTTP & JSON ke Server
+    HTTPClient http;
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    DynamicJsonDocument doc(200000);
+    doc["image"] = imageBase64;
+    String body;
+    serializeJson(doc, body);
+    
+    tampilLCD("VERIFIKASI PLAT", "KE SERVER...");
+    int httpCode = http.POST(body);
+
+    // 4. Pengambilan Keputusan (Decision Making) berdasarkan respon server
+    if (httpCode == HTTP_CODE_OK) {
+      String response = http.getString();
+      DynamicJsonDocument resDoc(2048);
+      deserializeJson(resDoc, response);
+
+      String status = resDoc["status"];
+      
+      if (status == "success") {
+        String ticketCode = resDoc["ticket_code"];
+        String slotName = resDoc["slot_name"];
+        
+        tampilLCD("MASUK SUKSES", "SLOT: " + slotName);
+        bukaPalang(); // Panggil aktuator
+        delay(5000);
+        tutupPalang(); // Panggil aktuator
+        
+      } else if (status == "full") {
+        tampilLCD("PARKIR PENUH", "MOHON MAAF");
+      } else {
+        tampilLCD("PLAT TAK TERBACA", "COBA LAGI");
+      }
+    } else {
+      tampilLCD("KONEKSI GAGAL", "HTTP: " + String(httpCode));
+    }
+    http.end();
+    digitalWrite(LED_PIN, HIGH);
+  }
+}
+
+5.3.4 Source Code Output atau Aktuator
+
+Bagian ini didedikasikan untuk mengendalikan perangkat output (LCD Display dan Motor Servo pada palang pintu gerbang).
+C++
+
+// Aktuator Servo: Membuka Palang
+void bukaPalang() {
+  palangServo.write(90); // Menggerakkan servo ke 90 derajat
+  Serial.println("PALANG DIBUKA");
+}
+
+// Aktuator Servo: Menutup Palang
+void tutupPalang() {
+  palangServo.write(0); // Mengembalikan servo ke posisi awal (0 derajat)
+  Serial.println("PALANG DITUTUP");
+}
+
+// Aktuator Display: Memperbarui tampilan teks pada layar LCD I2C
+void tampilLCD(String baris1, String baris2) {
+  lcd.clear();
+  
+  lcd.setCursor(0, 0);
+  lcd.print(baris1);
+  
+  lcd.setCursor(0, 1);
+  lcd.print(baris2);
+}
