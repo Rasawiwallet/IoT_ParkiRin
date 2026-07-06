@@ -1,0 +1,238 @@
+5.3.1 Source Code Inisialisasi
+
+Bagian ini memuat konfigurasi awal sistem saat booting, meliputi pengaturan pin, inisialisasi layar OLED, motor servo, koneksi WiFi, modul RFID RC522, serta pembuatan endpoint web server untuk menerima scan tiket dari HP.
+C++
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\nBooting Gate Keluar...");
+
+  // Inisialisasi Scanner Serial (Opsional/Cadangan)
+  scannerSerial.begin(9600, SERIAL_8N1, SCANNER_RX, SCANNER_TX);
+
+  // Inisialisasi Pin Sensor dan Servo
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  palangServo.attach(SERVO_PIN);
+  tutupPalang();
+
+  // Inisialisasi Layar OLED
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED gagal");
+    while(1);
+  }
+  tampilOLED("Booting...", "V1.0 Wrover");
+
+  // Inisialisasi Koneksi WiFi
+  tampilOLED("Connect WiFi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status()!= WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+
+  // Inisialisasi Modul RFID SPI
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+  rfid.PCD_Init();
+  byte version = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+  if (version == 0x00 || version == 0xFF) {
+    Serial.println("WARNING: RFID Gagal Komunikasi!");
+  } else {
+    Serial.println("RFID Ready");
+  }
+
+  // Inisialisasi Web Server untuk Scan Karcis via HP
+  server.on("/scan", HTTP_POST, handleScanFromHP);
+  server.begin();
+  
+  tampilOLED("Gate Keluar", WiFi.localIP().toString());
+  delay(2000);
+  resetState();
+}
+
+5.3.2 Source Code Pembacaan Input atau Sensor
+
+Bagian ini mendefinisikan fungsi-fungsi untuk membaca data lingkungan fisik maupun jaringan, seperti membaca jarak mobil via ultrasonik, membaca kartu RFID, serta menangkap input tiket melalui Web Server (HP) atau Scanner Fisik.
+C++
+
+// Fungsi membaca sensor ultrasonik
+long bacaUltrasonik(){
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long durasi = pulseIn(ECHO_PIN, HIGH, 30000);
+  return durasi * 0.034 / 2; // Konversi ke cm
+}
+
+// Fungsi membaca kartu RFID
+void cekRFID(){
+  if(!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()){
+    return;
+  }
+  String uidString = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    uidString += String(rfid.uid.uidByte[i] < 0x10? "0" : "");
+    uidString += String(rfid.uid.uidByte[i], HEX);
+  }
+  uidString.toUpperCase();
+
+  tampilOLED("UID: " + uidString, "Proses Bayar...");
+  delay(1500);
+
+  // Bebaskan kartu sebelum proses selanjutnya
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  konfirmasiBayar(); // Lanjut ke pemrosesan data
+  waitingRFID = false;
+}
+
+// Fungsi membaca input kode karcis dari request Web Server (HP)
+void handleScanFromHP() {
+  if (server.hasArg("ticket")) {
+    String data = server.arg("ticket");
+    data.trim();
+    if(data.startsWith("PRK-") && data.length() == 10){
+      ticketCodeDariScanner = data;
+      ticketReady = true;
+      tampilOLED("Karcis OK", data);
+      server.send(200, "text/plain", "OK: Tiket diterima");
+    } else {
+      tampilOLED("Karcis Invalid");
+      server.send(400, "text/plain", "Invalid Ticket");
+    }
+  } else {
+    server.send(400, "text/plain", "Missing ticket param");
+  }
+}
+
+5.3.3 Source Code Pemrosesan Data
+
+Bagian ini bertugas memvalidasi tiket, mengelola logika pembayaran dengan mengirim request HTTP (JSON) ke server utama, dan mengambil keputusan berdasarkan balasan dari server tersebut.
+C++
+
+// Proses verifikasi karcis ke server API
+void verifikasiPlat(){
+  tampilOLED("Verifikasi...", "Cek Data Server");
+  HTTPClient http;
+  http.begin(serverGateOut);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(25000);
+
+  DynamicJsonDocument doc(1024); 
+  doc["ticket_code"] = ticketCodeDariScanner;
+  doc["image"] = ""; // Gambar dinonaktifkan
+  
+  String body;
+  serializeJson(doc, body);
+  int httpCode = http.POST(body);
+
+  if(httpCode == 200){
+    String response = http.getString();
+    DynamicJsonDocument resDoc(1024);
+    deserializeJson(resDoc, response);
+    String status = resDoc["status"];
+
+    if(status == "verified"){
+      currentFee = resDoc["fee"];
+      tampilOLED("TIKET COCOK", "Rp " + String(currentFee));
+      delay(2000);
+      tampilOLED("SILAKAN TAP", "KARTU RFID");
+      waitingRFID = true;
+      ticketReady = false;
+    } else {
+      tampilOLED("GAGAL!", "DATA SALAH");
+      delay(3000);
+      resetState();
+    }
+  } else {
+    tampilOLED("Server Error", String(httpCode));
+    delay(3000);
+    resetState();
+  }
+  http.end();
+}
+
+// Proses pemotongan saldo / konfirmasi pembayaran ke server
+void konfirmasiBayar(){
+  HTTPClient http;
+  http.begin(serverConfirmPay);
+  http.addHeader("Content-Type", "application/json");
+
+  DynamicJsonDocument doc(256);
+  doc["ticket_code"] = ticketCodeDariScanner;
+  String body;
+  serializeJson(doc, body);
+  int httpCode = http.POST(body);
+
+  if(httpCode == 200){
+    DynamicJsonDocument resDoc(512);
+    deserializeJson(resDoc, http.getString());
+
+    if(resDoc["status"] == "success"){
+      tampilOLED("BAYAR SUKSES", "Palang Buka");
+      bukaPalang(); // Panggil aktuator
+      delay(5000);
+      tutupPalang(); // Panggil aktuator
+      tampilOLED("Terima Kasih", "Hati-hati");
+      delay(2000);
+    } else {
+      tampilOLED("BAYAR GAGAL", "Coba Lagi");
+      delay(3000);
+    }
+  } else {
+    tampilOLED("Server Error", "Bayar Gagal");
+    delay(3000);
+  }
+  http.end();
+  
+  if(bacaUltrasonik() > 5){
+    resetState();
+  } else {
+    tampilOLED("Mobil Detected", "Scan via HP");
+  }
+}
+
+5.3.4 Source Code Output atau Aktuator
+
+Bagian ini dikhususkan untuk mengatur fungsi kontrol fisik pada sistem, yaitu menggerakkan palang (Motor Servo) serta menampilkan informasi antarmuka melalui layar (OLED I2C).
+C++
+
+// Aktuator Servo: Membuka Palang
+void bukaPalang(){ 
+  palangServo.write(90); 
+}
+
+// Aktuator Servo: Menutup Palang
+void tutupPalang(){ 
+  palangServo.write(0); 
+}
+
+// Aktuator Display: Menampilkan pesan di layar OLED
+void tampilOLED(String baris1, String baris2 = ""){
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.println(baris1);
+  
+  if(baris2 != ""){
+    display.setCursor(0,16);
+    display.println(baris2);
+  }
+  display.display();
+}
+
+// Reset tampilan dan state variabel ke kondisi siaga
+void resetState(){
+  ticketCodeDariScanner = "";
+  currentFee = 0;
+  waitingRFID = false;
+  ticketReady = false;
+  tampilOLED("Gate Keluar", "SIAP");
+}
