@@ -1,0 +1,218 @@
+5.4.1 Source Code Inisialisasi
+
+Bagian ini memuat konfigurasi awal saat mikrokontroler dinyalakan. Ini mencakup pengaturan pin untuk LED dan Buzzer, inisialisasi modul kamera ESP32-CAM berserta pengaturan pencahayaannya, serta melakukan koneksi ke jaringan WiFi.
+C++
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Inisialisasi Pin Output
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  // Inisialisasi dan Konfigurasi Kamera
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if(psramFound()){
+    config.frame_size = FRAMESIZE_UXGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 1;
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x", err);
+    blinkError();
+    return;
+  }
+
+  // Pengaturan Sensor Kamera (Kecerahan, Kontras, dsb)
+  sensor_t * s = esp_camera_sensor_get();
+  s->set_vflip(s, 1);   // Membalik gambar vertikal
+  s->set_hmirror(s, 0); // Membalik gambar horizontal
+  s->set_brightness(s, 1);
+  s->set_contrast(s, 1);
+  s->set_exposure_ctrl(s, 1);
+  s->set_aec2(s, 1);
+  s->set_ae_level(s, 2);
+  s->set_gain_ctrl(s, 1);
+  s->set_agc_gain(s, 30);
+  s->set_bpc(s, 1);
+  s->set_wpc(s, 1);
+
+  // Inisialisasi Koneksi WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  }
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
+  beepOK(); // Bunyi buzzer 1x tanda boot sukses
+}
+
+5.4.2 Source Code Pembacaan Input atau Sensor
+
+Karena perangkat ini berbasis CCTV/kamera pemantau, maka proses pembacaan inputnya adalah mengambil (capture) foto dari modul lensa secara periodik (berdasarkan interval waktu tertentu).
+C++
+
+// Fungsi utama (Loop) yang mengatur interval pengambilan foto
+void loop() {
+  if(WiFi.status() != WL_CONNECTED){
+    Serial.println("WiFi lost. Reconnecting...");
+    WiFi.reconnect();
+    delay(5000);
+    return;
+  }
+
+  // Mengirim sinyal kehidupan alat ke server setiap 5 detik
+  if (millis() - lastHeartbeat > 5000) {
+    sendHeartbeat();
+    lastHeartbeat = millis();
+  }
+
+  // Membaca input (mengambil foto) setiap 5 detik
+  if (millis() - lastCapture > interval) {
+    sendImageToServer(); // Memanggil fungsi pemrosesan data
+    lastCapture = millis();
+  }
+}
+
+// Fungsi ping / heartbeat alat
+void sendHeartbeat() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(heartbeatUrl);
+    http.setTimeout(3000);
+    int httpCode = http.POST("");
+    if (httpCode > 0) {
+      Serial.println("Heartbeat: " + String(httpCode));
+    }
+    http.end();
+  }
+}
+
+5.4.3 Source Code Pemrosesan Data
+
+Bagian ini bertugas untuk menangkap data dari sensor kamera, mengubahnya (Encoding) menjadi format Base64, membungkusnya dalam format JSON, lalu mengirimkannya ke server menggunakan metode HTTP POST. Bagian ini juga memproses balasan (response) dari server terkait status parkir.
+C++
+
+void sendImageToServer() {
+  digitalWrite(LED_PIN, HIGH);
+  
+  // Mengambil frame foto dari kamera
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    blinkError();
+    digitalWrite(LED_PIN, LOW);
+    return;
+  }
+
+  Serial.printf("Foto diambil. Size: %d bytes\n", fb->len);
+  
+  // Encoding gambar ke format string Base64
+  String imageBase64 = base64::encode(fb->buf, fb->len);
+  esp_camera_fb_return(fb); // Kosongkan memori frame buffer
+
+  // Proses pengiriman data ke server API
+  HTTPClient http;
+  http.begin(serverUrl);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(15000);
+
+  // Membuat struktur JSON berisi gambar dan nama area
+  String httpRequestData = "{\"image\":\"" + imageBase64 + "\",\"area_name\":\"" + area_name + "\"}";
+  int httpResponseCode = http.POST(httpRequestData);
+
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println(response);
+
+    // Proses membaca balasan dari server (Decoding JSON)
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, response);
+    String status = doc["status"]; 
+    
+    // Logika keputusan jika terjadi pelanggaran parkir
+    if(status == "wrong_slot" || status == "mismatch"){
+      Serial.println("SALAH PARKIR! ALARM!");
+      beepSalahParkir(); // Panggil fungsi aktuator
+    }
+    
+  } else {
+    Serial.print("Error kirim POST: ");
+    Serial.println(httpResponseCode);
+    blinkError();
+  }
+  
+  http.end();
+  digitalWrite(LED_PIN, LOW);
+}
+
+5.4.4 Source Code Output atau Aktuator
+
+Fungsi perangkat output pada alat ini direpresentasikan oleh LED indikator dan komponen Buzzer. Komponen ini akan memberikan sinyal peringatan berupa suara alarm jika mobil terdeteksi parkir di slot yang salah oleh sistem Machine Learning di server.
+C++
+
+// Aktuator Output: Alarm berbunyi jika status dari server adalah "salah parkir"
+void beepSalahParkir(){
+  // Bunyi cepat berulang 10 kali
+  for(int i=0; i<10; i++){ 
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(80);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(80);
+  }
+  // Bunyi panjang 1 detik
+  digitalWrite(BUZZER_PIN, HIGH); 
+  delay(1000);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// Aktuator Output: Indikator saat sistem pertama kali menyala (OK)
+void beepOK(){
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(100);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// Aktuator Output: Indikator saat kamera/koneksi mengalami kegagalan (Error)
+void blinkError() {
+  for(int i=0; i<6; i++){
+    digitalWrite(LED_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+  }
+}
